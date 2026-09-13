@@ -20,8 +20,14 @@ def fetch(url, path):
     if not url.startswith("https://"): fail("unsafe release URL")
     with urllib.request.urlopen(url, timeout=120) as response, Path(path).open("wb") as output: shutil.copyfileobj(response, output)
 def load(name, path, search):
-    spec=importlib.util.spec_from_file_location(name,path); module=importlib.util.module_from_spec(spec)
-    sys.path.insert(0,str(search)); spec.loader.exec_module(module); sys.path.pop(0); return module
+    # Never generate bytecode inside the extracted signed release tree.
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec=importlib.util.spec_from_file_location(name,path); module=importlib.util.module_from_spec(spec)
+        sys.path.insert(0,str(search)); spec.loader.exec_module(module); sys.path.pop(0); return module
+    finally:
+        sys.dont_write_bytecode = previous
 
 def verify_envelope(metadata, signature, public_key):
     data=json.loads(Path(metadata).read_bytes())
