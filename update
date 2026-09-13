@@ -35,7 +35,12 @@ def bridge_master_usb():
     rows = []
     try:
         result = subprocess.run(["findmnt", "-J", "-o", "TARGET,SOURCE,FSTYPE"], capture_output=True, text=True, timeout=15)
-        rows = json.loads(result.stdout).get("filesystems", []) if result.returncode == 0 else []
+        payload = json.loads(result.stdout) if result.returncode == 0 else {}
+        def walk(items):
+            for item in items:
+                yield item
+                yield from walk(item.get("children", []))
+        rows = list(walk(payload.get("filesystems", [])))
     except (OSError, ValueError, json.JSONDecodeError):
         pass
     candidates = []; diagnostics = []
