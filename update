@@ -32,21 +32,39 @@ def verify_envelope(metadata, signature, public_key):
     return data
 
 def bridge_master_usb():
+    rows = []
     try:
-        r=subprocess.run(["findmnt","-J","-o","TARGET,SOURCE,FSTYPE"],capture_output=True,text=True,timeout=15)
-        rows=json.loads(r.stdout).get("filesystems",[]) if r.returncode==0 else []
-    except Exception:
-        rows=[]
-    found=[]
+        result = subprocess.run(["findmnt", "-J", "-o", "TARGET,SOURCE,FSTYPE"], capture_output=True, text=True, timeout=15)
+        rows = json.loads(result.stdout).get("filesystems", []) if result.returncode == 0 else []
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    candidates = []; diagnostics = []
+    pseudo = {"proc", "sysfs", "tmpfs", "devtmpfs", "fuse.portal", "fuse.gvfsd-fuse"}
     for row in rows:
-        target=str(row.get("target","")); fs=str(row.get("fstype",""))
-        if not target.startswith("/") or fs in {"proc","sysfs","tmpfs","devtmpfs","fuse.portal","fuse.gvfsd-fuse"} or ("/run/user/" in target and (target.endswith("/gvfs") or target.endswith("/doc"))): continue
+        target, fstype = str(row.get("target", "")), str(row.get("fstype", ""))
+        reason = "candidate"
+        if not target.startswith("/"): reason = "non-absolute mount"
+        elif fstype in pseudo: reason = "pseudo filesystem"
+        elif "/run/user/" in target and (target.endswith("/gvfs") or target.endswith("/doc")): reason = "runtime mount"
+        if reason != "candidate": diagnostics.append({"mount": target, "source": row.get("source", ""), "fstype": fstype, "accepted": False, "reason": reason}); continue
         try:
-            m=Path(target).resolve()
-            if m.is_dir() and (m/"skydne/authorization.json").is_file() and (m/"skydne/authorization.sig").is_file(): found.append(m)
-        except (PermissionError,FileNotFoundError,OSError): continue
-    if len(found)!=1: fail("Insert exactly one authorized SKYDNE Master USB")
-    return found[0]
+            mount = Path(target).resolve()
+            auth = mount / "skydne/authorization.json"; sig = mount / "skydne/authorization.sig"
+            if not mount.is_dir(): reason = "mount is not a directory"
+            elif not auth.is_file() or not sig.is_file(): reason = "authorization files missing"
+            else: candidates.append(mount); reason = "accepted"
+        except (PermissionError, FileNotFoundError, OSError) as error:
+            reason = type(error).__name__
+        diagnostics.append({"mount": target, "source": row.get("source", ""), "fstype": fstype, "accepted": reason == "accepted", "reason": reason})
+    try:
+        path = Path("/var/log/skydne-eye/update-usb-discovery.json")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_text(json.dumps({"candidates": diagnostics, "valid_count": len(candidates)}, sort_keys=True) + "\n")
+        path.chmod(0o600)
+    except OSError:
+        pass
+    if len(candidates) != 1: fail("Insert exactly one authorized SKYDNE Master USB")
+    return candidates[0]
 
 def main():
     if os.geteuid()!=0: fail("root privileges are required")
