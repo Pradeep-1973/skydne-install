@@ -59,17 +59,18 @@ sys.dont_write_bytecode = True
 
 
 PRODUCT = "SKYDNE EYE"
-BOOTSTRAP_VERSION = "1.1.5"
+BOOTSTRAP_VERSION = "1.1.6"
 RELEASE_VERSION = "1.0.5"
 RELEASE_PACKAGING_REVISION = ""
 RELEASE_ARTIFACT_VERSION = "1.0.5"
 RELEASE_COMMIT = "124ea2484946da39c312f4fffa65024534c8b8b6"
 RELEASE_ARCHIVE = "skydne-eye-1.0.5-amd64.tar.gz"
 RELEASE_SHA256 = "f090e2f04390b0eb9682f8aeb2546d19cd1de7bd51efb41716e02f6c99e978cd"
-RELEASE_METADATA = "skydne-eye-1.0.4-amd64.metadata.json"
-RELEASE_SIGNATURE = "skydne-eye-1.0.4-amd64.metadata.sig"
+RELEASE_METADATA = "skydne-eye-1.0.5-amd64.metadata.json"
+RELEASE_SIGNATURE = "skydne-eye-1.0.5-amd64.metadata.sig"
 PUBLIC_RELEASE_BASE = "https://install.skydne.com/releases/1.0.5"
-DEFAULT_OFFLINE_DIR = Path("/var/cache/skydne-eye/releases/1.0.4")
+DEFAULT_OFFLINE_DIR = Path("/var/cache/skydne-eye/releases/1.0.5")
+NETWORK_DIAGNOSTIC_PATH = Path("/var/log/skydne-eye/network-release-failure.json")
 RECORDING_PATH = Path("/srv/skydne-recordings")
 AUTHORIZATION_FORMAT = "skydne-deployment-authorization-v1"
 BINDING_VERSION = 1
@@ -333,38 +334,90 @@ def required_label(label, pattern=None):
         print("Enter a valid " + label.lower() + ".")
 
 
-def network_available():
-    result = run(["curl", "-fsSI", "--connect-timeout", "5", "--max-time", "10",
-                  PUBLIC_RELEASE_BASE + "/" + RELEASE_METADATA], check=False, timeout=15)
-    return result.returncode == 0
+def _network_result_detail(result):
+    raw = getattr(result, "stdout", b"")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    status = str(raw).strip().splitlines()[-1] if str(raw).strip() else ""
+    return status if re.fullmatch(r"[0-9]{3}", status) else "unavailable"
 
 
-def release_files(work, online):
+def _network_failure_diagnostic(failure):
+    exit_code = int(failure["curl_exit_code"])
+    payload = {
+        "support_code": "SKYDNE-NET-RELEASE-001",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "url_category": failure["url_category"],
+        "http_status": failure["http_status"],
+        "curl_exit_code": exit_code,
+        "dns_result": "failed" if exit_code == 6 else "not_indicated",
+        "tls_result": "failed" if exit_code in {35, 51, 58, 59, 60, 77, 83, 90} else "not_indicated",
+        "retry_count": 3,
+    }
+    report = NETWORK_DIAGNOSTIC_PATH
+    report.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    report.write_text(json.dumps(payload, sort_keys=True) + "\n")
+    report.chmod(0o600)
+
+
+def _download_online_release(work):
+    names = ((RELEASE_METADATA, "metadata"), (RELEASE_SIGNATURE, "signature"),
+             (RELEASE_ARCHIVE, "bundle"))
+    destination = Path(work) / "release"
+    destination.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(destination, 0o700)
+    outputs = []
+    for name, category in names:
+        output = destination / name
+        url = PUBLIC_RELEASE_BASE + "/" + name
+        result = run(["curl", "-fL", "--proto", "=https", "--tlsv1.2",
+                      "--retry", "3", "--retry-all-errors", "--retry-delay", "2",
+                      "--connect-timeout", "10", "--max-time", "1800",
+                      "--write-out", "%{http_code}", "-o", str(output), url],
+                     check=False, timeout=1810)
+        if result.returncode:
+            output.unlink(missing_ok=True)
+            _network_failure_diagnostic({
+                "url_category": category,
+                "http_status": _network_result_detail(result),
+                "curl_exit_code": result.returncode,
+            })
+            return None
+        outputs.append(output)
+    return tuple(outputs)
+
+
+def _offline_release_files():
     names = (RELEASE_METADATA, RELEASE_SIGNATURE, RELEASE_ARCHIVE)
     override = os.environ.get("SKYDNE_OFFLINE_RELEASE_DIR")
     kit_directory = Path(__file__).resolve().parent
     working_directory = Path.cwd().resolve()
-    directories = ([Path(override)] if override else []) + [kit_directory, working_directory, DEFAULT_OFFLINE_DIR]
+    directories = ([Path(override)] if override else []) + [
+        kit_directory, working_directory, DEFAULT_OFFLINE_DIR]
     for directory in directories:
         if directory.is_absolute() and all((directory / name).is_file() for name in names):
-            print("Release source: verified offline cache")
             return tuple(directory / name for name in names)
-    if not online:
-        raise InstallError("Network unavailable and approved offline release is not staged")
-    destination = Path(work) / "release"
-    destination.mkdir(mode=0o700)
-    outputs = []
-    for name in names:
-        output = destination / name
-        result = run(["curl", "-fL", "--proto", "=https", "--tlsv1.2", "--retry", "2",
-                      "--connect-timeout", "10", "--max-time", "1800", "-o", str(output),
-                      PUBLIC_RELEASE_BASE + "/" + name], check=False, timeout=1810)
-        if result.returncode:
-            raise InstallError("Approved release download failed")
-        outputs.append(output)
-    print("Release source: approved online channel")
-    return tuple(outputs)
+    return None
 
+
+def release_files(work):
+    print("Checking release channel...")
+    online = _download_online_release(work)
+    if online is not None:
+        print("Online release available: YES")
+        print("Release source: approved online channel")
+        return online
+    print("Online release unavailable.")
+    print("Checking approved offline package...")
+    offline = _offline_release_files()
+    if offline is not None:
+        print("Release source: verified offline cache")
+        return offline
+    raise InstallError(
+        "SKYDNE EYE INSTALLATION FAILED\n"
+        "Support Code: SKYDNE-NET-RELEASE-001\n"
+        "Internet/release channel unavailable.\n"
+        "No approved offline release was found.")
 
 def verify_release(metadata, signature, archive, work):
     envelope = verify_signed_json(metadata, signature, RELEASE_PUBLIC_KEY, work)
@@ -677,11 +730,9 @@ def main():
         raise InstallError("Existing Skydne Eye installation detected; use the controlled update workflow")
     if state == "partial":
         raise InstallError("Partial Skydne Eye installation detected; use verified recovery before installation")
-    online = network_available()
     print(PRODUCT + " FIELD INSTALLER")
     print("Bootstrap: " + BOOTSTRAP_VERSION)
     print("System: Debian 13 amd64")
-    print("Network: " + ("ONLINE" if online else "OFFLINE; approved cache required"))
     with tempfile.TemporaryDirectory(prefix="skydne-field-install-") as work:
         os.chmod(work, 0o700)
         key = acquire_key(work)
@@ -691,7 +742,7 @@ def main():
         timezone = choose_timezone()
         modules = module_wizard()
         desktop_shortcut = choose_desktop_shortcut()
-        metadata, signature, archive = release_files(work, online)
+        metadata, signature, archive = release_files(work)
         verify_release(metadata, signature, archive, work)
         bundle = extract_release(archive, work)
         sys.path.insert(0, str(bundle / "core/deploy"))
