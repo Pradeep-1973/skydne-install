@@ -31,6 +31,23 @@ def verify_envelope(metadata, signature, public_key):
     if result.returncode or data.get("format")!="skydne-bundle-envelope-v1": fail("release signature verification failed")
     return data
 
+def bridge_master_usb():
+    try:
+        r=subprocess.run(["findmnt","-J","-o","TARGET,SOURCE,FSTYPE"],capture_output=True,text=True,timeout=15)
+        rows=json.loads(r.stdout).get("filesystems",[]) if r.returncode==0 else []
+    except Exception:
+        rows=[]
+    found=[]
+    for row in rows:
+        target=str(row.get("target","")); fs=str(row.get("fstype",""))
+        if not target.startswith("/") or fs in {"proc","sysfs","tmpfs","devtmpfs","fuse.portal","fuse.gvfsd-fuse"} or ("/run/user/" in target and (target.endswith("/gvfs") or target.endswith("/doc"))): continue
+        try:
+            m=Path(target).resolve()
+            if m.is_dir() and (m/"skydne/authorization.json").is_file() and (m/"skydne/authorization.sig").is_file(): found.append(m)
+        except (PermissionError,FileNotFoundError,OSError): continue
+    if len(found)!=1: fail("Insert exactly one authorized SKYDNE Master USB")
+    return found[0]
+
 def main():
     if os.geteuid()!=0: fail("root privileges are required")
     state=STATE/"installation.json"
@@ -48,7 +65,7 @@ def main():
         candidates=[item for item in expanded.iterdir() if item.is_dir()]
         if len(candidates)!=1: fail("release payload is incomplete")
         bundle=candidates[0]; host=load("production_host",bundle/"core/deploy/production_host.py",bundle/"core/deploy")
-        mount=load("update_cli",bundle/"core/deploy/update_cli.py",bundle/"core/deploy").master_usb()
+        mount=bridge_master_usb()
         backup=host.transaction_backup(Path("/var/backups/skydne-eye"),CONFIG/"backup-passphrase","1.0.5")
         args=[sys.executable,str(bundle/"core/deploy/production_host.py"),"--production","--activate","--bundle",str(bundle),"--site",str(CONFIG/"site.toml"),"--key-mount",str(mount),"--backup",backup["path"],"--backup-key",str(CONFIG/"backup-passphrase"),"--approved-commit",envelope["commit"]]
         env=dict(os.environ,SKYDNE_INSTALLER_ROOT=str(bundle/"core"),PYTHONPATH=str(bundle/"core/deploy"),PYTHONDONTWRITEBYTECODE="1")
