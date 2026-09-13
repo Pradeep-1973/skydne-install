@@ -1,0 +1,717 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "SKYDNE EYE installer must run as root (use sudo)." >&2
+  exit 1
+fi
+if [ ! -r /etc/os-release ] || ! grep -q '^ID=debian$' /etc/os-release || ! grep -Eq '^VERSION_ID="?13"?$' /etc/os-release; then
+  echo "SKYDNE EYE requires Debian 13." >&2
+  exit 1
+fi
+if [ "$(uname -m)" != x86_64 ]; then
+  echo "SKYDNE EYE requires Debian 13 amd64." >&2
+  exit 1
+fi
+
+missing=
+for command in python3 curl openssl findmnt lsblk tar; do
+  command -v "$command" >/dev/null 2>&1 || missing="$missing $command"
+done
+if [ -n "$missing" ]; then
+  echo "Installing minimal SKYDNE EYE bootstrap prerequisites..." >&2
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends python3 curl ca-certificates openssl util-linux tar
+fi
+
+umask 077
+runtime=$(mktemp /tmp/skydne-bootstrap.XXXXXX)
+cleanup() { rm -f "$runtime"; }
+trap cleanup EXIT HUP INT TERM
+cat >"$runtime" <<'SKYDNE_BOOTSTRAP_PYTHON'
+
+"""SKYDNE EYE one-command field bootstrap.
+
+This entry point intentionally contains only public verification keys and
+release coordinates. The qualified production installer remains inside the
+signed release and performs the authoritative preflight and activation.
+"""
+import datetime
+import hashlib
+import ipaddress
+import io
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+PRODUCT = "SKYDNE EYE"
+BOOTSTRAP_VERSION = "1.1.0"
+RELEASE_VERSION = "1.0.1"
+RELEASE_PACKAGING_REVISION = ""
+RELEASE_ARTIFACT_VERSION = "1.0.1"
+RELEASE_COMMIT = "4bc8163bb88798bd515bb9f6b2827217c401b8a7"
+RELEASE_ARCHIVE = "skydne-eye-1.0.1-amd64.tar.gz"
+RELEASE_SHA256 = "4607e9cd3c88e54c0c96c4085b70c7ff8ce1568bd560e26b4686796aae18abb3"
+RELEASE_METADATA = "skydne-eye-1.0.1-amd64.metadata.json"
+RELEASE_SIGNATURE = "skydne-eye-1.0.1-amd64.metadata.sig"
+PUBLIC_RELEASE_BASE = "https://install.skydne.com/releases/1.0.1"
+DEFAULT_OFFLINE_DIR = Path("/var/cache/skydne-eye/releases/1.0.1")
+RECORDING_PATH = Path("/srv/skydne-recordings")
+AUTHORIZATION_FORMAT = "skydne-deployment-authorization-v1"
+BINDING_VERSION = 1
+DEPLOYMENT_PURPOSE = "skydne-eye-deployment"
+DEPLOYMENT_ISSUER = "Skydne Deployment Authority"
+DEPLOYMENT_KEY_ID = "deployment-authority-v1"
+PSEUDO_FILESYSTEMS = frozenset({"proc", "sysfs", "tmpfs", "devtmpfs",
+                                "fuse.portal", "fuse.gvfsd-fuse"})
+
+RELEASE_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAWAagANTFW9VMgfUlf9AJ8czoAE3faQkJ/0MRPHkgJk4=
+-----END PUBLIC KEY-----
+"""
+DEPLOYMENT_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAJRqumAdNqAYnw4rDRUzvnpiE6G9skGC3FEyp65IFIGE=
+-----END PUBLIC KEY-----
+"""
+
+
+class InstallError(RuntimeError):
+    pass
+
+
+def run(arguments, *, input_bytes=None, timeout=60, check=True):
+    result = subprocess.run(arguments, input=input_bytes, capture_output=True,
+                            timeout=timeout)
+    if check and result.returncode:
+        raise InstallError("Command failed: " + Path(arguments[0]).name)
+    return result
+
+
+def sha256(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def canonical(data):
+    return (json.dumps(data, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=True) + "\n").encode()
+
+
+def verify_signed_json(document, signature, public_key, work):
+    document, signature = Path(document), Path(signature)
+    raw = document.read_bytes()
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InstallError("Signed metadata is not valid JSON") from error
+    if raw != canonical(data) or signature.stat().st_size != 64:
+        raise InstallError("Signed metadata is not canonical")
+    key = Path(work) / ("verification-" + secrets.token_hex(6) + ".pem")
+    key.write_text(public_key)
+    key.chmod(0o600)
+    verified = run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(key),
+                    "-rawin", "-in", str(document), "-sigfile", str(signature)],
+                   check=False)
+    key.unlink(missing_ok=True)
+    if verified.returncode:
+        raise InstallError("Ed25519 signature verification failed")
+    return data
+
+
+def normalize_filesystem_serial(value):
+    supplied = str(value or "").strip()
+    if not re.fullmatch(r"[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}", supplied):
+        raise InstallError("Deployment key filesystem serial is invalid")
+    compact = supplied.replace("-", "").upper()
+    return compact[:4] + "-" + compact[4:]
+
+
+def canonical_binding(facts):
+    hardware = str(facts.get("hardware_serial", facts.get("serial", ""))).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{4,128}", hardware):
+        raise InstallError("Deployment key hardware serial is invalid")
+    filesystem = normalize_filesystem_serial(
+        facts.get("filesystem_serial", facts.get("filesystem_uuid", "")))
+    fields = {
+        "authorization_version": AUTHORIZATION_FORMAT,
+        "binding_version": BINDING_VERSION,
+        "filesystem_serial": filesystem,
+        "filesystem_uuid": filesystem,
+        "hardware_serial": hardware,
+        "purpose": DEPLOYMENT_PURPOSE,
+    }
+    return canonical(fields)
+
+
+def _block_rows(items):
+    for item in items:
+        yield item
+        yield from _block_rows(item.get("children", []))
+
+
+def device_facts(mount):
+    mount = Path(mount).resolve()
+    found = run(["findmnt", "-J", "-T", str(mount)])
+    filesystems = json.loads(found.stdout).get("filesystems", [])
+    if len(filesystems) != 1 or Path(filesystems[0].get("target", "")).resolve() != mount:
+        raise InstallError("Authorization is not at a filesystem mount root")
+    source = filesystems[0].get("source", "")
+    if not source.startswith("/dev/"):
+        raise InstallError("Deployment key is not a block device")
+    probe = run(["lsblk", "-J", "-p", "-o",
+                 "PATH,TYPE,PKNAME,UUID,PARTUUID,SERIAL,WWN,TRAN,RM", source])
+    rows = list(_block_rows(json.loads(probe.stdout).get("blockdevices", [])))
+    matches = [row for row in rows if row.get("path") == source]
+    if len(matches) != 1:
+        raise InstallError("Deployment key identity is ambiguous")
+    row = matches[0]
+    parent = None
+    if row.get("pkname"):
+        parent_path = row["pkname"]
+        if not parent_path.startswith("/dev/"):
+            parent_path = "/dev/" + parent_path
+        parent_probe = run(["lsblk", "-J", "-p", "-d", "-o",
+                            "PATH,SERIAL,WWN,TRAN,RM", parent_path], check=False)
+        parents = json.loads(parent_probe.stdout or b"{}").get("blockdevices", []) \
+            if parent_probe.returncode == 0 else []
+        parent = parents[0] if len(parents) == 1 else None
+    physical = parent or row
+    transport = physical.get("tran") or row.get("tran") or ""
+    removable = str(physical.get("rm") or row.get("rm") or "0").lower() \
+        in ("1", "true", "yes")
+    if transport != "usb":
+        raise InstallError("Deployment credential is not on the USB bus")
+    return {
+        "filesystem_uuid": row.get("uuid") or filesystems[0].get("uuid") or "",
+        "hardware_serial": physical.get("serial") or "",
+        "transport": transport,
+        "removable": removable,
+        "source": source,
+        "parent": physical.get("path") or source,
+    }
+
+
+def verify_deployment_key(mount, work, now=None):
+    root = Path(mount).resolve()
+    authorization = root / "skydne/authorization.json"
+    signature = root / "skydne/authorization.sig"
+    if not authorization.is_file() or authorization.is_symlink() or not signature.is_file():
+        raise InstallError("Deployment authorization files are missing")
+    data = verify_signed_json(authorization, signature, DEPLOYMENT_PUBLIC_KEY, work)
+    top_level = {"format", "issuer", "key_id", "authorization_id", "issued_at",
+                 "valid_from", "expires_at", "device", "allowed_release_versions",
+                 "allowed_modules", "allowed_site_ids"}
+    if (set(data) != top_level or data.get("issuer") != DEPLOYMENT_ISSUER or
+            data.get("key_id") != DEPLOYMENT_KEY_ID or
+            not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", data.get("authorization_id", ""))):
+        raise InstallError("Unsupported deployment authorization")
+    for scope in ("allowed_release_versions", "allowed_modules", "allowed_site_ids"):
+        values = data.get(scope)
+        if (not isinstance(values, list) or not values or len(values) != len(set(values)) or
+                any(not isinstance(value, str) or not value for value in values)):
+            raise InstallError("Deployment authorization scope is invalid")
+    master = data["authorization_id"].startswith("skydne-master-deployment-")
+    if (not master or "*" not in data["allowed_release_versions"] or
+            "*" not in data["allowed_modules"] or "*" not in data["allowed_site_ids"]):
+        raise InstallError("A site-independent Skydne Master Deployment Key is required")
+    expected = data.get("device", {})
+    required = {"authorization_version", "binding_version", "filesystem_serial",
+                "filesystem_uuid", "hardware_serial", "purpose", "binding_sha256"}
+    if (data.get("format") != AUTHORIZATION_FORMAT or set(expected) != required or
+            expected.get("authorization_version") != AUTHORIZATION_FORMAT or
+            expected.get("binding_version") != BINDING_VERSION or
+            expected.get("purpose") != DEPLOYMENT_PURPOSE):
+        raise InstallError("Unsupported deployment authorization binding")
+    facts = device_facts(root)
+    filesystem = normalize_filesystem_serial(facts["filesystem_uuid"])
+    binding_hash = hashlib.sha256(canonical_binding(facts)).hexdigest()
+    if (facts["hardware_serial"] != expected["hardware_serial"] or
+            filesystem != expected["filesystem_serial"] or
+            filesystem != expected["filesystem_uuid"] or
+            binding_hash != expected["binding_sha256"]):
+        raise InstallError("Deployment key device identity does not match authorization")
+    when = now or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        issued = datetime.datetime.fromisoformat(data["issued_at"].replace("Z", "+00:00"))
+        start = datetime.datetime.fromisoformat(data["valid_from"].replace("Z", "+00:00"))
+        end = datetime.datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
+    except (KeyError, ValueError) as error:
+        raise InstallError("Deployment authorization validity is invalid") from error
+    if issued != start or not start <= when <= end:
+        raise InstallError("Deployment authorization is outside its validity period")
+    return {"mount": root, "facts": facts, "authorization": data}
+
+
+def excluded_mount(target, filesystem):
+    if filesystem in PSEUDO_FILESYSTEMS:
+        return True
+    parts = Path(target).parts
+    return (len(parts) >= 5 and parts[:3] == ("/", "run", "user") and
+            parts[4] in ("gvfs", "doc"))
+
+
+def mounted_key_candidates():
+    result = run(["findmnt", "-J", "-o", "TARGET,SOURCE,FSTYPE"], check=False)
+    if result.returncode:
+        return []
+    candidates = []
+    for row in _block_rows(json.loads(result.stdout).get("filesystems", [])):
+        target = row.get("target")
+        source = row.get("source", "")
+        filesystem = row.get("fstype", "")
+        if (not target or excluded_mount(target, filesystem) or
+                not source.startswith("/dev/")):
+            continue
+        mount = Path(target)
+        if not mount.is_absolute():
+            continue
+        try:
+            authorization = mount / "skydne/authorization.json"
+            if authorization.is_file() and not authorization.is_symlink():
+                candidates.append(mount)
+        except (PermissionError, OSError):
+            # Desktop automounters can expose inaccessible mounts. Discovery
+            # skips one candidate; verify_deployment_key still authenticates
+            # every accessible candidate against its block-device identity.
+            continue
+    return sorted(set(candidates))
+
+
+def acquire_key(work):
+    print("\nInsert the Skydne Master Deployment Key, then press Enter.")
+    input_from_operator("")
+    valid, invalid = [], 0
+    for mount in mounted_key_candidates():
+        try:
+            valid.append(verify_deployment_key(mount, work))
+        except (InstallError, OSError, subprocess.SubprocessError):
+            invalid += 1
+    if len(valid) != 1:
+        if invalid:
+            raise InstallError("No uniquely valid Skydne Deployment Key was detected")
+        raise InstallError("Skydne Deployment Key not detected")
+    print("Physical key status: VERIFIED")
+    return valid[0]
+
+
+def input_from_operator(prompt):
+    try:
+        with open("/dev/tty", "w", encoding="utf-8", buffering=1) as terminal_out:
+            terminal_out.write(prompt)
+            terminal_out.flush()
+        with open("/dev/tty", "r", encoding="utf-8") as terminal_in:
+            value = terminal_in.readline()
+    except (OSError, io.UnsupportedOperation) as error:
+        raise InstallError("An interactive terminal is required") from error
+
+    if value == "":
+        raise InstallError("Installer input ended unexpectedly")
+
+    return value.rstrip("\n")
+
+
+def required_label(label, pattern=None):
+    while True:
+        value = input_from_operator(label + ": ").strip()
+        if value and len(value) <= 128 and not any(ord(c) < 32 for c in value):
+            if pattern is None or re.fullmatch(pattern, value):
+                return value
+        print("Enter a valid " + label.lower() + ".")
+
+
+def network_available():
+    result = run(["curl", "-fsSI", "--connect-timeout", "5", "--max-time", "10",
+                  PUBLIC_RELEASE_BASE + "/" + RELEASE_METADATA], check=False, timeout=15)
+    return result.returncode == 0
+
+
+def release_files(work, online):
+    names = (RELEASE_METADATA, RELEASE_SIGNATURE, RELEASE_ARCHIVE)
+    override = os.environ.get("SKYDNE_OFFLINE_RELEASE_DIR")
+    kit_directory = Path(__file__).resolve().parent
+    working_directory = Path.cwd().resolve()
+    directories = ([Path(override)] if override else []) + [kit_directory, working_directory, DEFAULT_OFFLINE_DIR]
+    for directory in directories:
+        if directory.is_absolute() and all((directory / name).is_file() for name in names):
+            print("Release source: verified offline cache")
+            return tuple(directory / name for name in names)
+    if not online:
+        raise InstallError("Network unavailable and approved offline release is not staged")
+    destination = Path(work) / "release"
+    destination.mkdir(mode=0o700)
+    outputs = []
+    for name in names:
+        output = destination / name
+        result = run(["curl", "-fL", "--proto", "=https", "--tlsv1.2", "--retry", "2",
+                      "--connect-timeout", "10", "--max-time", "1800", "-o", str(output),
+                      PUBLIC_RELEASE_BASE + "/" + name], check=False, timeout=1810)
+        if result.returncode:
+            raise InstallError("Approved release download failed")
+        outputs.append(output)
+    print("Release source: approved online channel")
+    return tuple(outputs)
+
+
+def verify_release(metadata, signature, archive, work):
+    envelope = verify_signed_json(metadata, signature, RELEASE_PUBLIC_KEY, work)
+    required = {"architecture", "build_timestamp", "bundle_file", "commit", "format",
+                "physical_key_verifier", "sha256", "version"}
+    if (set(envelope) != required or envelope.get("format") != "skydne-bundle-envelope-v1" or
+            envelope.get("architecture") != "amd64" or envelope.get("version") != RELEASE_VERSION or
+            envelope.get("commit") != RELEASE_COMMIT or envelope.get("bundle_file") != RELEASE_ARCHIVE or
+            envelope.get("sha256") != RELEASE_SHA256 or Path(archive).name != RELEASE_ARCHIVE):
+        raise InstallError("Release metadata does not match the approved production release")
+    verifier = envelope.get("physical_key_verifier", {})
+    if verifier != {"authorization_version": AUTHORIZATION_FORMAT,
+                     "binding_version": BINDING_VERSION,
+                     "purpose": DEPLOYMENT_PURPOSE}:
+        raise InstallError("Release physical-key verifier is not approved")
+    if sha256(archive) != RELEASE_SHA256:
+        raise InstallError("Release SHA256 verification failed")
+    print("Release signature status: VERIFIED")
+    return envelope
+
+
+def root_disk():
+    source = run(["findmnt", "-nro", "SOURCE", "--target", "/"]).stdout.decode().strip()
+    probe = run(["lsblk", "-s", "-npo", "PATH,TYPE", source], check=False)
+    disks = [line.split()[0] for line in probe.stdout.decode().splitlines()
+             if len(line.split()) == 2 and line.split()[1] == "disk"]
+    if len(disks) != 1:
+        raise InstallError("System disk identity is ambiguous")
+    return disks[0]
+
+
+def recording_candidates(key_parent):
+    result = run(["lsblk", "-J", "-b", "-p", "-o",
+                  "PATH,TYPE,FSTYPE,UUID,SIZE,MOUNTPOINTS,PKNAME,TRAN,MODEL"])
+    system = root_disk()
+    rows = list(_block_rows(json.loads(result.stdout).get("blockdevices", [])))
+    candidates = []
+    for row in rows:
+        if row.get("type") not in ("part", "disk") or row.get("fstype") not in ("ext4", "xfs") or not row.get("uuid"):
+            continue
+        path = row.get("path", "")
+        parent = row.get("pkname") or path
+        if parent and not parent.startswith("/dev/"):
+            parent = "/dev/" + parent
+        mounts = [value for value in (row.get("mountpoints") or []) if value]
+        if system in (path, parent) or key_parent in (path, parent) or any(value in ("/", "/boot", "/boot/efi") for value in mounts):
+            continue
+        if mounts and str(RECORDING_PATH) not in mounts:
+            continue
+        candidates.append({"path": path, "uuid": row["uuid"], "fstype": row["fstype"],
+                           "size": int(row.get("size") or 0), "mounts": mounts,
+                           "model": (row.get("model") or "").strip()})
+    return candidates
+
+
+def choose_recording(key_parent):
+    candidates = recording_candidates(key_parent)
+    if not candidates:
+        raise InstallError("No safe recording filesystem was detected; provision a separate ext4/xfs disk")
+    print("\nRecording storage:")
+    for index, item in enumerate(candidates, 1):
+        gib = item["size"] / 1024 ** 3
+        mounted = ", ".join(item["mounts"]) or "not mounted"
+        print(f"  {index}. {item['path']}  {gib:.1f} GiB  {item['fstype']}  {mounted}")
+    while True:
+        answer = input_from_operator("Select recording storage [1]: ").strip() or "1"
+        if answer.isdigit() and 1 <= int(answer) <= len(candidates):
+            return candidates[int(answer) - 1]
+        print("Select one of the listed recording filesystems.")
+
+
+def configure_recording(item):
+    RECORDING_PATH.mkdir(parents=True, exist_ok=True)
+    if item.get("single_disk_mode"):
+        fstab = Path("/etc/fstab")
+        existing = fstab.read_text() if fstab.is_file() else ""
+        if re.search(rf"\s{re.escape(str(RECORDING_PATH))}\s", existing):
+            if not re.search(rf"^/\s+{re.escape(str(RECORDING_PATH))}\s+none\s+bind", existing, re.M):
+                raise InstallError("Existing single-disk mount configuration requires review")
+        else:
+            with fstab.open("a") as stream:
+                if existing and not existing.endswith("\n"):
+                    stream.write("\n")
+                stream.write("/ " + str(RECORDING_PATH) + " none bind,nofail 0 0\n")
+        return
+    current = run(["findmnt", "-nro", "UUID", "--target", str(RECORDING_PATH)], check=False)
+    if current.returncode == 0 and current.stdout.decode().strip():
+        if current.stdout.decode().strip() != item["uuid"]:
+            raise InstallError("Recording mount identity changed")
+        return
+    fstab = Path("/etc/fstab")
+    line = f"UUID={item['uuid']} {RECORDING_PATH} {item['fstype']} defaults,nofail 0 2"
+    existing = fstab.read_text() if fstab.is_file() else ""
+    if re.search(rf"\s{re.escape(str(RECORDING_PATH))}\s", existing):
+        raise InstallError("Existing recording mount configuration requires review")
+    with fstab.open("a") as stream:
+        if existing and not existing.endswith("\n"):
+            stream.write("\n")
+        stream.write(line + "\n")
+    run(["mount", str(RECORDING_PATH)])
+    actual = run(["findmnt", "-nro", "UUID", "--target", str(RECORDING_PATH)]).stdout.decode().strip()
+    if actual != item["uuid"]:
+        raise InstallError("Recording filesystem failed post-mount verification")
+
+
+def local_ip():
+    result = run(["hostname", "-I"], check=False)
+    for value in result.stdout.decode().split():
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        if address.version == 4 and not address.is_loopback:
+            return value
+    return "127.0.0.1"
+
+
+def initial_admin_password():
+    source = os.environ.get("SKYDNE_INITIAL_ADMIN_PASSWORD_FILE")
+    if not source:
+        raise InstallError("Protected initial credential file is required")
+    path = Path(source)
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        raise InstallError("Protected initial credential file is invalid")
+    value = path.read_text(encoding="utf-8").strip()
+    if len(value) < 16:
+        raise InstallError("Initial credential does not meet production policy")
+    return value
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    return json.dumps(value)
+
+
+def prepare_site(work, customer, site_name, site_id, recording, desktop_shortcut):
+    config = Path("/etc/skydne-eye")
+    if config.exists() and any(config.iterdir()):
+        raise InstallError("Existing Skydne Eye configuration requires recovery or upgrade")
+    config.mkdir(mode=0o700, parents=True, exist_ok=True)
+    secret_file = config / "secrets.json"
+    initial_file = config / "initial-login.txt"
+    initial_password = initial_admin_password()
+    secret_data = {
+        "database_password": secrets.token_urlsafe(36),
+        "admin_username": "admin",
+        "admin_password": initial_password,
+        "auth_hash_secret": secrets.token_hex(32),
+    }
+    secret_file.write_text(json.dumps(secret_data, sort_keys=True) + "\n")
+    secret_file.chmod(0o600)
+    initial_file.write_text("Username: admin\nPassword: " + initial_password +
+                            "\nChange this password at first login.\n")
+    initial_file.chmod(0o600)
+    hostname = socket.gethostname().split(".", 1)[0]
+    timezone = Path("/etc/timezone").read_text().strip() if Path("/etc/timezone").is_file() else "UTC"
+    site = {
+        "site_id": site_id, "hostname": hostname, "timezone": timezone,
+        "site_name": site_name, "customer": customer,
+        "recording_path": str(RECORDING_PATH), "recording_uuid": recording["uuid"], "single_disk_mode": bool(recording.get("single_disk_mode", False)),
+        "ai_required": False, "pharos_required": False,
+        "alpr_config": "/etc/skydne-eye/alpr.ini",
+        "database_client": "/etc/skydne-eye/database-client.cnf",
+        "backup_key_file": "/etc/skydne-eye/backup-passphrase",
+        "public_url": "http://" + local_ip() + "/",
+        "schema_version": 1, "web_bind": "127.0.0.1", "web_port": 80,
+        "alpr_bind": "127.0.0.1", "alpr_port": 8095,
+        "database_name": "zm", "database_user": "skydne_zm",
+        "secrets_file": str(secret_file), "ai_event_root": "/var/lib/skydne-eye/alpr",
+        "logging_root": "/var/log/skydne-eye", "camera_config": "/etc/skydne-eye/cameras.json",
+        "ai_enabled": False, "alpr_enabled": False, "gpu_enabled": False,
+        "tunnel_enabled": False, "network_watch_enabled": False,
+        "gate_capture_enabled": False, "recording_auto_delete": False,
+        "recording_section_seconds": 600, "ai_retention_days": 180,
+        "ai_max_snapshots_mb": 4096, "health_interval_seconds": 60,
+        "health_timeout_seconds": 10, "version_file": "/var/lib/skydne-eye/version.json",
+        "desktop_shortcut": bool(desktop_shortcut),
+    }
+    site_file = Path(work) / "site.toml"
+    site_file.write_text("".join(f"{key} = {toml_value(value)}\n" for key, value in site.items()))
+    site_file.chmod(0o600)
+    backup_key = config / "backup-passphrase"
+    backup_key.write_text(secrets.token_hex(48) + "\n")
+    backup_key.chmod(0o600)
+    return site_file, site, initial_file
+
+
+def extract_release(archive, work):
+    destination = Path(work) / "expanded"
+    destination.mkdir(mode=0o700)
+    with tarfile.open(archive, "r:gz") as package:
+        for member in package.getmembers():
+            name = Path(member.name)
+            if name.is_absolute() or ".." in name.parts or not name.parts:
+                raise InstallError("Release archive path is unsafe")
+            if member.issym() or member.islnk():
+                link = Path(member.linkname)
+                if link.is_absolute() or ".." in link.parts:
+                    raise InstallError("Release archive link is unsafe")
+        package.extractall(destination, filter="data")
+    roots = [item for item in destination.iterdir() if item.is_dir()]
+    if len(roots) != 1 or not (roots[0] / "core/deploy/production_host.py").is_file():
+        raise InstallError("Release installer payload is missing")
+    return roots[0]
+
+
+def host_state():
+    markers = [Path("/var/lib/skydne-eye/installation.json"), Path("/opt/skydne-eye/current"),
+               Path("/etc/zm/zm.conf"), Path("/usr/share/zoneminder/www")]
+    present = [item.exists() or item.is_symlink() for item in markers]
+    if all(present):
+        return "existing"
+    if not any(present):
+        return "fresh"
+    return "partial"
+
+
+def graphical_desktop_available():
+    return Path("/usr/share/xsessions").is_dir() or Path("/usr/share/wayland-sessions").is_dir()
+
+
+def choose_desktop_shortcut():
+    if not graphical_desktop_available():
+        return False
+    return input_from_operator("Create SKYDNE EYE desktop shortcut? [Y/n]: ").strip().lower() in ("", "y", "yes")
+
+
+def create_desktop_shortcut(site):
+    if not site.get("desktop_shortcut"):
+        return False
+    shortcut = Path("/usr/share/applications/skydne-eye.desktop")
+    shortcut.write_text("[Desktop Entry]\nType=Application\nName=SKYDNE EYE\n" +
+                        "Comment=Open the SKYDNE EYE video platform\nExec=xdg-open http://localhost/\nIcon=camera-video\nCategories=AudioVideo;Security;\n")
+    shortcut.chmod(0o644)
+    return True
+
+
+def apply_development_overlay(bundle):
+    if os.environ.get("SKYDNE_DEV_QUALIFICATION") != "1":
+        return
+    root = Path(os.environ.get("SKYDNE_QUALIFICATION_OVERLAY", ""))
+    marker = root / "DEVELOPMENT-QUALIFICATION"
+    if not root.is_dir() or marker.read_text(encoding="utf-8").strip() != "UNSIGNED-LOCAL-QUALIFICATION":
+        raise InstallError("Development qualification overlay is invalid")
+    paths = ("deploy/controlled_host.py", "deploy/product_namespace.py", "deploy/production_host.py",
+             "dependency-profiles/debian13-core.json", "dependency-profiles/debian13-core-artifact.json",
+             "dependency-profiles/debian13-core-resolution.json")
+    for rel in paths:
+        source = root / rel
+        target = bundle / "core" / rel
+        if source.is_symlink() or not source.is_file() or source.resolve() != source.absolute():
+            raise InstallError("Development qualification overlay file is invalid")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
+def invoke_installer(bundle, site_file, key, work):
+    installer = bundle / "core/deploy/production_host.py"
+    environment = dict(os.environ, SKYDNE_INSTALLER_ROOT=str(bundle / "core"),
+                       PYTHONPATH=str(bundle / "core/deploy"),
+                       PYTHONDONTWRITEBYTECODE="1")
+    arguments = [sys.executable, str(installer), "--production", "--activate",
+                 "--bundle", str(bundle), "--site", str(site_file),
+                 "--key-mount", str(key["mount"]), "--approved-commit", RELEASE_COMMIT]
+    result = subprocess.run(arguments, env=environment)
+    if result.returncode:
+        raise InstallError("Qualified production installer reported failure")
+
+
+def module_wizard():
+    print("\nModules:")
+    print("  [X] Skydne Eye Core (mandatory)")
+    print("  [ ] AI (not available in this release)")
+    print("  [ ] ANPR (not available in this release)")
+    print("  [ ] Future modules (not available in this release)")
+    input_from_operator("Press Enter to continue with Core: ")
+    return ["core"]
+
+
+def main():
+    if os.geteuid() != 0:
+        raise InstallError("Root privileges are required")
+    state = host_state()
+    if state == "existing":
+        raise InstallError("Existing Skydne Eye installation detected; use the controlled update workflow")
+    if state == "partial":
+        raise InstallError("Partial Skydne Eye installation detected; use verified recovery before installation")
+    online = network_available()
+    print(PRODUCT + " FIELD INSTALLER")
+    print("Bootstrap: " + BOOTSTRAP_VERSION)
+    print("System: Debian 13 amd64")
+    print("Network: " + ("ONLINE" if online else "OFFLINE; approved cache required"))
+    with tempfile.TemporaryDirectory(prefix="skydne-field-install-") as work:
+        os.chmod(work, 0o700)
+        key = acquire_key(work)
+        customer = required_label("Customer")
+        site_name = required_label("Site Name")
+        site_id = required_label("Site ID", r"[A-Za-z][A-Za-z0-9-]{0,62}")
+        modules = module_wizard()
+        desktop_shortcut = choose_desktop_shortcut()
+        metadata, signature, archive = release_files(work, online)
+        verify_release(metadata, signature, archive, work)
+        bundle = extract_release(archive, work)
+        sys.path.insert(0, str(bundle / "core/deploy"))
+        sys.modules.pop("storage_selection", None)
+        try:
+            import storage_selection
+            selected_storage = storage_selection.choose(input_from_operator)
+            recording = storage_selection.prepare(selected_storage, input_from_operator)
+        except (ImportError, RuntimeError) as error:
+            raise InstallError("Recording storage selection failed") from error
+        apply_development_overlay(bundle)
+        print("\nInstallation summary")
+        print("  Customer: " + customer)
+        print("  Site: " + site_name)
+        print("  Site ID: " + site_id)
+        print("  Release package: " + RELEASE_ARTIFACT_VERSION)
+        print("  Core version: " + RELEASE_VERSION)
+        print("  Modules: " + ", ".join(modules))
+        print("  Recording storage: " + recording["path"] + " -> " + str(RECORDING_PATH))
+        print("  Physical key: VERIFIED")
+        print("  Release signature: VERIFIED")
+        if input_from_operator("Type INSTALL to begin: ").strip() != "INSTALL":
+            raise InstallError("Installation cancelled; no product installation was started")
+        configure_recording(recording)
+        site_file, site, initial_file = prepare_site(work, customer, site_name, site_id, recording, desktop_shortcut)
+        invoke_installer(bundle, site_file, key, work)
+        create_desktop_shortcut(site)
+        print("\nSKYDNE EYE INSTALLED SUCCESSFULLY")
+        print("Site: " + site_name + " (" + site_id + ")")
+        print("Release package: " + RELEASE_ARTIFACT_VERSION)
+        print("Core version: " + RELEASE_VERSION)
+        print("Modules: Skydne Eye Core")
+        print("Recording storage: " + str(RECORDING_PATH))
+        print("Health: PASS")
+        print("Login URL: " + site["public_url"])
+        print("Initial login is stored in: " + str(initial_file))
+        print("Run: skydne status")
+        print("Run: skydne module list")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (InstallError, OSError, KeyError, subprocess.SubprocessError, tarfile.TarError) as error:
+        print("INSTALLATION STOPPED: " + str(error), file=sys.stderr)
+        raise SystemExit(1)
+SKYDNE_BOOTSTRAP_PYTHON
+
+python3 "$runtime" "$@"

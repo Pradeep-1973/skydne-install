@@ -1,0 +1,5 @@
+eff018df03647608005e894057cbcf798d04b1acafc8fa7d54fb76b27b61d9cd  install
+8b7a00e7bfd7303769c9e9b03b1a630f7cd0075151958958a72a2fd1ebfe572c  releases/1.0.1/release-authority-v1.pem
+2469712d58e231f9acf1fec979c611502c5747ad129ef3187051207b27b70782  releases/1.0.1/skydne-eye-1.0.1-amd64.metadata.json
+00ed57a736d71533eccae5eeca7f009cda1955fba3ab0fbd3302eea50ec5b095  releases/1.0.1/skydne-eye-1.0.1-amd64.metadata.sig
+4607e9cd3c88e54c0c96c4085b70c7ff8ce1568bd560e26b4686796aae18abb3  releases/1.0.1/skydne-eye-1.0.1-amd64.tar.gz
