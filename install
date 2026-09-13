@@ -59,17 +59,17 @@ sys.dont_write_bytecode = True
 
 
 PRODUCT = "SKYDNE EYE"
-BOOTSTRAP_VERSION = "1.1.2"
-RELEASE_VERSION = "1.0.3"
+BOOTSTRAP_VERSION = "1.1.3"
+RELEASE_VERSION = "1.0.4"
 RELEASE_PACKAGING_REVISION = ""
-RELEASE_ARTIFACT_VERSION = "1.0.3"
-RELEASE_COMMIT = "5c97fcd08acf936f2eeeb3adbc3fe0798136c3f0"
-RELEASE_ARCHIVE = "skydne-eye-1.0.3-amd64.tar.gz"
-RELEASE_SHA256 = "645001701a549cb21f0d560941749a65a89d407afb9c4d439118d08e4c78bab0"
-RELEASE_METADATA = "skydne-eye-1.0.3-amd64.metadata.json"
-RELEASE_SIGNATURE = "skydne-eye-1.0.3-amd64.metadata.sig"
-PUBLIC_RELEASE_BASE = "https://install.skydne.com/releases/1.0.3"
-DEFAULT_OFFLINE_DIR = Path("/var/cache/skydne-eye/releases/1.0.3")
+RELEASE_ARTIFACT_VERSION = "1.0.4"
+RELEASE_COMMIT = "e993732acc0f05587215cda71953104e50df42dd"
+RELEASE_ARCHIVE = "skydne-eye-1.0.4-amd64.tar.gz"
+RELEASE_SHA256 = "ffc2c4562254422cacca77baf221c4d84bd497b9188c80083df480d0e28d8fc4"
+RELEASE_METADATA = "skydne-eye-1.0.4-amd64.metadata.json"
+RELEASE_SIGNATURE = "skydne-eye-1.0.4-amd64.metadata.sig"
+PUBLIC_RELEASE_BASE = "https://install.skydne.com/releases/1.0.4"
+DEFAULT_OFFLINE_DIR = Path("/var/cache/skydne-eye/releases/1.0.4")
 RECORDING_PATH = Path("/srv/skydne-recordings")
 AUTHORIZATION_FORMAT = "skydne-deployment-authorization-v1"
 BINDING_VERSION = 1
