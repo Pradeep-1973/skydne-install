@@ -5,3 +5,9 @@ c2e83a0b87530e39366789156c92ab2b88553596f4d11ca6eccaab9667de7489  releases/1.0.6
 8b7a00e7bfd7303769c9e9b03b1a630f7cd0075151958958a72a2fd1ebfe572c  releases/1.0.6/release-authority-v1.pem
 
 673ea431fe26a909603e06a36af821ae0d82d863b609944dde83f34540feffd8  releases/1.0.7/skydne-eye-1.0.7-amd64.tar.gz
+
+a17693e9e80f2bf8e683687398dbb239e2cd7412a58587d8ca1992bfc2dd251d  update
+8b7a00e7bfd7303769c9e9b03b1a630f7cd0075151958958a72a2fd1ebfe572c  releases/1.0.9/release-authority-v1.pem
+0e95cd1c2e6ba028fa20cdaba0b52995efc0a29a45c669674cb2b6e0167167ad  releases/1.0.9/skydne-eye-1.0.9-amd64.metadata.json
+d1c614bd9dcef79a9282d9f276d4f6e0253bdf3d0de7a1ee9e46de1fc89b0074  releases/1.0.9/skydne-eye-1.0.9-amd64.metadata.sig
+edc91ba628f201df7687550da31364b62e7fb4604275bcaf6537b1454b8f45e1  releases/1.0.9/skydne-eye-1.0.9-amd64.tar.gz
