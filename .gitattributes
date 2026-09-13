@@ -4,3 +4,5 @@ SHA256SUMS text eol=lf
 *.pem text eol=lf
 *.sig binary
 *.tar.gz binary
+
+install-fallback-1.1.2 text eol=lf
