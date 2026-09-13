@@ -52,20 +52,21 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 PRODUCT = "SKYDNE EYE"
-BOOTSTRAP_VERSION = "1.1.0"
-RELEASE_VERSION = "1.0.1"
+BOOTSTRAP_VERSION = "1.1.1"
+RELEASE_VERSION = "1.0.2"
 RELEASE_PACKAGING_REVISION = ""
-RELEASE_ARTIFACT_VERSION = "1.0.1"
-RELEASE_COMMIT = "4bc8163bb88798bd515bb9f6b2827217c401b8a7"
-RELEASE_ARCHIVE = "skydne-eye-1.0.1-amd64.tar.gz"
-RELEASE_SHA256 = "4607e9cd3c88e54c0c96c4085b70c7ff8ce1568bd560e26b4686796aae18abb3"
-RELEASE_METADATA = "skydne-eye-1.0.1-amd64.metadata.json"
-RELEASE_SIGNATURE = "skydne-eye-1.0.1-amd64.metadata.sig"
-PUBLIC_RELEASE_BASE = "https://install.skydne.com/releases/1.0.1"
-DEFAULT_OFFLINE_DIR = Path("/var/cache/skydne-eye/releases/1.0.1")
+RELEASE_ARTIFACT_VERSION = "1.0.2"
+RELEASE_COMMIT = "06635f7ba84e8948d9a61e3083540a8c0c553f7c"
+RELEASE_ARCHIVE = "skydne-eye-1.0.2-amd64.tar.gz"
+RELEASE_SHA256 = "a6afeb9617ca133aa8f47dfb63b3777d45ed8e3ce58bc541668c682f38b52be1"
+RELEASE_METADATA = "skydne-eye-1.0.2-amd64.metadata.json"
+RELEASE_SIGNATURE = "skydne-eye-1.0.2-amd64.metadata.sig"
+PUBLIC_RELEASE_BASE = "https://install.skydne.com/releases/1.0.2"
+DEFAULT_OFFLINE_DIR = Path("/var/cache/skydne-eye/releases/1.0.2")
 RECORDING_PATH = Path("/srv/skydne-recordings")
 AUTHORIZATION_FORMAT = "skydne-deployment-authorization-v1"
 BINDING_VERSION = 1
@@ -478,17 +479,39 @@ def local_ip():
     return "127.0.0.1"
 
 
-def initial_admin_password():
-    source = os.environ.get("SKYDNE_INITIAL_ADMIN_PASSWORD_FILE")
-    if not source:
-        raise InstallError("Protected initial credential file is required")
-    path = Path(source)
-    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
-        raise InstallError("Protected initial credential file is invalid")
-    value = path.read_text(encoding="utf-8").strip()
-    if len(value) < 16:
-        raise InstallError("Initial credential does not meet production policy")
-    return value
+def signed_initial_admin_credential(bundle):
+    signed_deploy = bundle / "core/deploy"
+    sys.path.insert(0, str(signed_deploy))
+    sys.modules.pop("initial_credential", None)
+    try:
+        import initial_credential
+        username, password = initial_credential.fresh_install_credential()
+        login_text = initial_credential.initial_login_text()
+    except (ImportError, AttributeError, ValueError) as error:
+        raise InstallError("Signed initial credential policy is invalid") from error
+    if username != "admin" or len(password) < 16 or login_text != (
+            "Username: " + username + "\nPassword: " + password +
+            "\nChange this password after first login.\n"):
+        raise InstallError("Signed initial credential policy is invalid")
+    return username, password, login_text
+
+
+def choose_timezone():
+    while True:
+        value = input_from_operator("Timezone [Asia/Kolkata]: ").strip() or "Asia/Kolkata"
+        try:
+            ZoneInfo(value)
+        except (ValueError, ZoneInfoNotFoundError):
+            print("Enter a valid IANA timezone.")
+            continue
+        return value
+
+
+def apply_timezone(timezone):
+    run(["timedatectl", "set-timezone", timezone])
+    observed = run(["timedatectl", "show", "-p", "Timezone", "--value"]).stdout.decode().strip()
+    if observed != timezone:
+        raise InstallError("System timezone verification failed")
 
 
 def toml_value(value):
@@ -499,27 +522,25 @@ def toml_value(value):
     return json.dumps(value)
 
 
-def prepare_site(work, customer, site_name, site_id, recording, desktop_shortcut):
+def prepare_site(work, bundle, customer, site_name, site_id, timezone, recording, desktop_shortcut):
     config = Path("/etc/skydne-eye")
     if config.exists() and any(config.iterdir()):
         raise InstallError("Existing Skydne Eye configuration requires recovery or upgrade")
     config.mkdir(mode=0o700, parents=True, exist_ok=True)
     secret_file = config / "secrets.json"
     initial_file = config / "initial-login.txt"
-    initial_password = initial_admin_password()
+    admin_username, initial_password, initial_login = signed_initial_admin_credential(bundle)
     secret_data = {
         "database_password": secrets.token_urlsafe(36),
-        "admin_username": "admin",
+        "admin_username": admin_username,
         "admin_password": initial_password,
         "auth_hash_secret": secrets.token_hex(32),
     }
     secret_file.write_text(json.dumps(secret_data, sort_keys=True) + "\n")
     secret_file.chmod(0o600)
-    initial_file.write_text("Username: admin\nPassword: " + initial_password +
-                            "\nChange this password at first login.\n")
+    initial_file.write_text(initial_login)
     initial_file.chmod(0o600)
     hostname = socket.gethostname().split(".", 1)[0]
-    timezone = Path("/etc/timezone").read_text().strip() if Path("/etc/timezone").is_file() else "UTC"
     site = {
         "site_id": site_id, "hostname": hostname, "timezone": timezone,
         "site_name": site_name, "customer": customer,
@@ -662,6 +683,7 @@ def main():
         customer = required_label("Customer")
         site_name = required_label("Site Name")
         site_id = required_label("Site ID", r"[A-Za-z][A-Za-z0-9-]{0,62}")
+        timezone = choose_timezone()
         modules = module_wizard()
         desktop_shortcut = choose_desktop_shortcut()
         metadata, signature, archive = release_files(work, online)
@@ -689,9 +711,12 @@ def main():
         if input_from_operator("Type INSTALL to begin: ").strip() != "INSTALL":
             raise InstallError("Installation cancelled; no product installation was started")
         configure_recording(recording)
-        site_file, site, initial_file = prepare_site(work, customer, site_name, site_id, recording, desktop_shortcut)
+        apply_timezone(timezone)
+        site_file, site, initial_file = prepare_site(
+            work, bundle, customer, site_name, site_id, timezone, recording, desktop_shortcut)
         invoke_installer(bundle, site_file, key, work)
         create_desktop_shortcut(site)
+        _, initial_password, _ = signed_initial_admin_credential(bundle)
         print("\nSKYDNE EYE INSTALLED SUCCESSFULLY")
         print("Site: " + site_name + " (" + site_id + ")")
         print("Release package: " + RELEASE_ARTIFACT_VERSION)
@@ -700,6 +725,9 @@ def main():
         print("Recording storage: " + str(RECORDING_PATH))
         print("Health: PASS")
         print("Login URL: " + site["public_url"])
+        print("Username: admin")
+        print("Password: " + initial_password)
+        print("Change this password after first login.")
         print("Initial login is stored in: " + str(initial_file))
         print("Run: skydne status")
         print("Run: skydne module list")

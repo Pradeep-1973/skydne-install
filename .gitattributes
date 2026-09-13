@@ -1,0 +1,6 @@
+install text eol=lf
+SHA256SUMS text eol=lf
+*.json text eol=lf
+*.pem text eol=lf
+*.sig binary
+*.tar.gz binary
