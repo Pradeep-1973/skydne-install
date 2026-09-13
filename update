@@ -1,3 +1,9 @@
+#!/bin/sh
+set -eu
+if id -u | grep -qx 0; then :; else echo 'SKYDNE UPDATE BRIDGE FAILED: root privileges are required' >&2; exit 1; fi
+command -v python3 >/dev/null 2>&1 || { echo 'SKYDNE UPDATE BRIDGE FAILED: python3 is required' >&2; exit 1; }
+umask 077
+exec python3 - <<'SKYDNE_UPDATE_BRIDGE_PYTHON'
 #!/usr/bin/env python3
 """One-time, signed bridge for pre-update Core installations."""
 import hashlib, importlib.util, json, os, shutil, subprocess, sys, tarfile, tempfile, urllib.request
@@ -50,3 +56,5 @@ def main():
         if result.returncode: fail("signed activation failed; rollback was attempted")
         print(json.dumps({"status":"PASS","previous":"1.0.5","current":"1.0.7","recordings_preserved":True}))
 if __name__=="__main__": main()
+
+SKYDNE_UPDATE_BRIDGE_PYTHON
