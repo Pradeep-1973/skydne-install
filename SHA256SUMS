@@ -1,4 +1,4 @@
-bd45d43f4768c5858681ec8a8ccbc250d83502e50978ec91022de598ffaa51e3  install
+d80b4c1f415f1941999f7528b3b49927a8774f6c6301b1dc134de813b4d3a1ee  install
 8b7a00e7bfd7303769c9e9b03b1a630f7cd0075151958958a72a2fd1ebfe572c  releases/1.0.1/release-authority-v1.pem
 2469712d58e231f9acf1fec979c611502c5747ad129ef3187051207b27b70782  releases/1.0.1/skydne-eye-1.0.1-amd64.metadata.json
 00ed57a736d71533eccae5eeca7f009cda1955fba3ab0fbd3302eea50ec5b095  releases/1.0.1/skydne-eye-1.0.1-amd64.metadata.sig
@@ -14,4 +14,3 @@ d9f31c3cfb287867fcb50ec3d6cc7c8bb30500c5adbf6935ee0b7a1b3f6dd559  releases/1.0.3
 cb3cabd6f92d84ed70e2db9da99953df2ace592b129cd76e79a92e8ff101ff5b  install-fallback-1.1.2
 3ca589cc149a2675249fa4b3b3a612b1e922ef8c3a536502c1e70844e1740ffa  install ffc2c4562254422cacca77baf221c4d84bd497b9188c80083df480d0e28d8fc4  releases/1.0.4/skydne-eye-1.0.4-amd64.tar.gz 19c2a9da5ebe9d6f20f41694d5b1605a02d9836a3c7b2d09d19ed7246c0625a2  releases/1.0.4/skydne-eye-1.0.4-amd64.metadata.json 617071ab294b73710531fb787f993f54e5df3fb07dbd62d4becf5893c7ef2035  releases/1.0.4/skydne-eye-1.0.4-amd64.metadata.sig 8b7a00e7bfd7303769c9e9b03b1a630f7cd0075151958958a72a2fd1ebfe572c  releases/1.0.4/release-authority-v1.pem
 ec78da7b5b69814bdd958769a23a2658e907d09df87a938af4a4fc290edefc96  install f090e2f04390b0eb9682f8aeb2546d19cd1de7bd51efb41716e02f6c99e978cd  releases/1.0.5/skydne-eye-1.0.5-amd64.tar.gz c8eeb8d1cabe03e5abd7c40deea271104dc8328321deebdc4d03424178f9cbcd  releases/1.0.5/skydne-eye-1.0.5-amd64.metadata.json 099efaa36a13386ed2b9dc892f58f12b85c03c63358c76d9da724bc4f497304c  releases/1.0.5/skydne-eye-1.0.5-amd64.metadata.sig 8b7a00e7bfd7303769c9e9b03b1a630f7cd0075151958958a72a2fd1ebfe572c  releases/1.0.5/release-authority-v1.pem
-d80b4c1f415f1941999f7528b3b49927a8774f6c6301b1dc134de813b4d3a1ee  install
